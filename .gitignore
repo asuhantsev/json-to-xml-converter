@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
+env/
 build/
 develop-eggs/
 dist/
@@ -15,24 +16,29 @@ lib64/
 parts/
 sdist/
 var/
-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
 
 # Virtual Environment
 venv/
-env/
 ENV/
 
-# IDE specific files
+# IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
 
 # Project specific
-*.log
-*.xml
-*.json 
+exports/
+frontend/
+
+# Logs
+*.log 
