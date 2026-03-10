@@ -1,7 +1,0 @@
-{
-  "database": "dolt",
-  "backend": "dolt",
-  "dolt_mode": "server",
-  "dolt_database": "json_to_xml_tgchat",
-  "project_id": "05d47295-a4c8-4da9-9124-7e84b4dd5371"
-}

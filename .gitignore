@@ -40,6 +40,14 @@ ENV/
 exports/
 frontend/
 .tgxml_presets.json
+legacy/
+.beads/
+docs/
+tests/
+AGENTS.md
+scripts/benchmark_large_export.py
+scripts/smoke_test.sh
+scripts/smoke_tui.sh
 
 # Logs
 *.log 
