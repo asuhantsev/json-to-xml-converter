@@ -39,9 +39,15 @@ ENV/
 # Project specific
 exports/
 frontend/
+.tgxml_presets.json
 
 # Logs
 *.log 
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Dolt database files (added by bd init)
 .dolt/

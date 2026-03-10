@@ -1,112 +1,344 @@
 import json
 import xml.etree.ElementTree as ET
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 import os
 import io
-import copy
 import subprocess
+import argparse
+import sys
+import logging
+import copy
+from dataclasses import dataclass, asdict
+from typing import Optional, List
 
-def indent(elem, level=0):
-    """
-    Функция для добавления отступов в XML для улучшения читаемости.
-    """
-    i = "\n" + level * "    "
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog
+except ModuleNotFoundError:
+    tk = None
+    ttk = None
+    filedialog = None
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger("tgxml")
+
+
+@dataclass
+class ConversionOptions:
+    source_paths: List[str]
+    output_path: str
+    selected_authors: Optional[set] = None
+    start_date: str = ""
+    end_date: str = ""
+    use_date_range: bool = False
+    include_reactions: bool = True
+    human_readable: bool = True
+    include_service: bool = False
+    include_media_meta: bool = False
+    include_entities: bool = False
+    anonymize: bool = False
+
+
+@dataclass
+class ConversionResult:
+    messages: int
+    output_path: str
+    filter_stats: dict
+    validation_issues: Optional[list] = None
+
+
+def validate_telegram_export(data):
+    issues = []
+    if not isinstance(data, dict):
+        return ["Root JSON must be an object"]
+    if 'messages' not in data:
+        issues.append("Missing required field: messages")
+    elif not isinstance(data.get('messages'), list):
+        issues.append("Field 'messages' must be an array")
+    for i, msg in enumerate(data.get('messages', [])):
+        if not isinstance(msg, dict):
+            issues.append(f"messages[{i}] is not an object")
+            continue
+        if 'type' not in msg:
+            issues.append(f"messages[{i}] missing field 'type'")
+        if 'date' not in msg:
+            issues.append(f"messages[{i}] missing field 'date'")
+    return issues
+
+
+def anonymize_messages(messages):
+    user_map = {}
+    counter = 1
+
+    def alias(name):
+        nonlocal counter
+        if not name:
+            return name
+        if name not in user_map:
+            user_map[name] = f"user_{counter:03d}"
+            counter += 1
+        return user_map[name]
+
+    out = []
+    for msg in messages:
+        cp = copy.deepcopy(msg)
+        cp['from'] = alias(cp.get('from', ''))
+        if 'actor' in cp:
+            cp['actor'] = alias(cp.get('actor', ''))
+        if 'from_id' in cp and cp.get('from_id'):
+            cp['from_id'] = f"id_{abs(hash(str(cp['from_id']))) % 10_000_000}"
+        if 'actor_id' in cp and cp.get('actor_id'):
+            cp['actor_id'] = f"id_{abs(hash(str(cp['actor_id']))) % 10_000_000}"
+        out.append(cp)
+    return out
+
+def normalize_text_content(text):
+    """Normalize Telegram text field (string/list/misc) into plain string."""
+    if isinstance(text, list):
+        return ''.join(
+            part.get('text', '') if isinstance(part, dict) else str(part)
+            for part in text
+        )
+    if isinstance(text, str):
+        return text
+    if text is None:
+        return ''
+    return str(text)
+
+
+def extract_message_date(message):
+    return str(message.get('date', '')).split('T')[0]
+
+
+def filter_messages(messages, selected_authors=None, start_date='', end_date='',
+                    use_date_range=False, require_text=True, return_stats=False,
+                    include_service=False):
+    """Single filtering pipeline used by counters and export."""
+    selected_authors = selected_authors or set()
+    filtered = []
+    stats = {
+        "total_items": len(messages),
+        "excluded_non_message": 0,
+        "excluded_author": 0,
+        "excluded_empty_text": 0,
+        "excluded_date": 0,
+        "excluded_service": 0,
+        "included": 0,
+    }
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            stats["excluded_non_message"] += 1
+            continue
+
+        msg_type = msg.get('type')
+        if msg_type != 'message':
+            if include_service and msg_type == 'service':
+                pass
+            else:
+                if msg_type == 'service':
+                    stats["excluded_service"] += 1
+                else:
+                    stats["excluded_non_message"] += 1
+                continue
+
+        author = msg.get('from', '')
+        if selected_authors and author and author not in selected_authors:
+            stats["excluded_author"] += 1
+            continue
+
+        text = normalize_text_content(msg.get('text', ''))
+        if require_text and msg_type == 'message' and not text.strip():
+            stats["excluded_empty_text"] += 1
+            continue
+
+        if use_date_range:
+            date_str = extract_message_date(msg)
+            if start_date and date_str < start_date:
+                stats["excluded_date"] += 1
+                continue
+            if end_date and date_str > end_date:
+                stats["excluded_date"] += 1
+                continue
+
+        filtered.append(msg)
+        stats["included"] += 1
+
+    if return_stats:
+        return filtered, stats
+    return filtered
+
+
+def build_message_element(root, message, include_reactions=True,
+                          include_media_meta=False, include_entities=False):
+    msg_element = ET.SubElement(root, "message")
+    msg_type = message.get('type', 'message')
+    msg_element.set('kind', msg_type)
+    msg_element.set('id', str(message.get('id', '')))
+    msg_element.set('date', message.get('date', ''))
+    msg_element.set('sender', message.get('from', ''))
+
+    if msg_type == 'service':
+        if message.get('action'):
+            msg_element.set('action', str(message.get('action')))
+        if message.get('actor'):
+            msg_element.set('actor', str(message.get('actor')))
+
+    text_element = ET.SubElement(msg_element, "text")
+    text_element.text = normalize_text_content(message.get('text', '')).strip()
+
+    reply_to = message.get('reply_to_message_id')
+    if reply_to:
+        msg_element.set('reply_to', str(reply_to))
+
+    if include_reactions and 'reactions' in message:
+        reactions_element = ET.SubElement(msg_element, "reactions")
+        for reaction in message.get('reactions', []):
+            reaction_element = ET.SubElement(reactions_element, "reaction")
+            reaction_element.set('emoji', reaction.get('emoji', ''))
+            reaction_element.set('count', str(reaction.get('count', 0)))
+
+    if include_media_meta:
+        media_keys = [
+            "photo", "photo_file_size", "file", "file_name", "file_size", "mime_type",
+            "media_type", "width", "height", "duration_seconds", "thumbnail"
+        ]
+        media_payload = {k: message.get(k) for k in media_keys if k in message}
+        if media_payload:
+            media_element = ET.SubElement(msg_element, "media")
+            for key, value in media_payload.items():
+                media_element.set(key, str(value))
+
+    if include_entities and isinstance(message.get('text_entities'), list):
+        entities_element = ET.SubElement(msg_element, "entities")
+        for entity in message.get('text_entities', []):
+            if not isinstance(entity, dict):
+                continue
+            entity_element = ET.SubElement(entities_element, "entity")
+            entity_element.set("type", str(entity.get("type", "")))
+            if "text" in entity:
+                entity_element.set("text", str(entity.get("text", "")))
+
+    return msg_element
+
+
+def indent_xml(elem, level=0):
+    i = "\n" + level * "  "
     if len(elem):
         if not elem.text or not elem.text.strip():
-            elem.text = i + "    "
-        for child in elem:
-            indent(child, level + 1)
-        if not child.tail or not child.tail.strip():
-            child.tail = i
-    if level and (not elem.tail or not elem.tail.strip()):
+            elem.text = i + "  "
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = i
+        for subelem in elem:
+            indent_xml(subelem, level + 1)
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = i
+    elif level and (not elem.tail or not elem.tail.strip()):
         elem.tail = i
 
-# Modify load_json to handle GUI errors
-def load_json(file_path):
-    try:
-        with open(file_path, 'r', encoding='utf-8') as file:
-            return json.load(file)
-    except FileNotFoundError:
-        raise Exception(f"Файл '{file_path}' не найден.")
-    except json.JSONDecodeError as e:
-        raise Exception(f"Ошибка при разборе JSON файла: {e}")
 
-# Modify process_group to update progress
-def process_group(group, root, progress_var=None, status_var=None):
-    if not isinstance(group, dict):
-        if status_var:
-            status_var.set(f"Пропущен элемент: {group} (не является словарём)")
-        return
-    
-    group_name = group.get('name', 'Unnamed Group')
-    group_id = group.get('id', 'unknown_id')
-    
-    if status_var:
-        status_var.set(f"Обработка группы: {group_name} (ID: {group_id})")
-    
-    group_type = group.get('type', 'unknown_type')
-    messages = group.get('messages', [])
-    
-    print(f"Обработка группы: {group_name} (ID: {group_id}) с {len(messages)} сообщениями.")
-    
-    # Создаём элемент <chat> для группы
-    chat_elem = ET.SubElement(root, 'chat')
-    
-    # Добавляем информацию о группе
-    name_elem = ET.SubElement(chat_elem, 'name')
-    name_elem.text = group_name
-    
-    type_elem = ET.SubElement(chat_elem, 'type')
-    type_elem.text = group_type
-    
-    id_elem = ET.SubElement(chat_elem, 'id')
-    id_elem.text = str(group_id)
-    
-    # Создаём подэлемент для сообщений
-    messages_elem = ET.SubElement(chat_elem, 'messages')
-    
-    included_messages = 0
-    skipped_messages = 0
-    
-    # Обработка каждого сообщения
-    for msg_index, msg in enumerate(messages):
-        if isinstance(msg, dict) and msg.get('type') == 'message':
-            # Обработка поля 'text'
-            text = msg.get('text', '')
-            if isinstance(text, list):
-                # Если 'text' — список, объединяем все части в строку
-                text = ''.join([part.get('text', '') if isinstance(part, dict) else str(part) for part in text])
-            elif not isinstance(text, str):
-                # Если 'text' не строка и не список, преобразуем в строку
-                text = str(text)
-            
-            # Проверяем, не пустой ли текст
-            if text.strip() == '':
-                skipped_messages += 1
-                continue  # Пропускаем это сообщение
-            
-            # Создаём элемент <message>
-            message_elem = ET.SubElement(messages_elem, 'message')
-            
-            # Добавляем дату сообщения
-            date_elem = ET.SubElement(message_elem, 'date')
-            date_elem.text = msg.get('date', '')
-            
-            # Добавляем имя отправителя
-            name_sender_elem = ET.SubElement(message_elem, 'name')
-            name_sender_elem.text = msg.get('from', '')
-            
-            # Добавляем текст сообщения
-            text_elem = ET.SubElement(message_elem, 'text')
-            text_elem.text = text
-            
-            included_messages += 1
-        else:
-            # Пропускаем сообщения не типа 'message'
-            skipped_messages += 1
-    
-    print(f"Сообщений включено: {included_messages}, пропущено: {skipped_messages}")
+def load_json_file(file_path):
+    with open(file_path, 'r', encoding='utf-8') as file:
+        return json.load(file)
+
+
+def get_available_authors(messages):
+    return sorted({
+        msg.get('from', '')
+        for msg in messages
+        if isinstance(msg, dict) and msg.get('type') == 'message' and msg.get('from')
+    })
+
+
+def get_date_range_from_messages(messages):
+    dates = sorted([extract_message_date(msg) for msg in messages if extract_message_date(msg)])
+    if not dates:
+        return '', ''
+    return dates[0], dates[-1]
+
+
+def get_message_dates_range_label(messages):
+    start_date, end_date = get_date_range_from_messages(messages)
+    if not start_date:
+        return ""
+    if start_date == end_date:
+        return f"({start_date})"
+    return f"({start_date}_to_{end_date})"
+
+
+def sanitize_path_component(value):
+    text = (value or "chat").strip()
+    for ch in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
+        text = text.replace(ch, "_")
+    return text or "chat"
+
+
+def build_export_label(chat_name, messages):
+    safe_chat_name = sanitize_path_component(chat_name)
+    date_range = get_message_dates_range_label(messages)
+    if date_range:
+        return f"{safe_chat_name}_{date_range}"
+    return safe_chat_name
+
+
+def build_xml_tree(messages, include_reactions=True, human_readable=True,
+                   include_media_meta=False, include_entities=False):
+    root = ET.Element("messages")
+    for message in messages:
+        build_message_element(
+            root,
+            message,
+            include_reactions=include_reactions,
+            include_media_meta=include_media_meta,
+            include_entities=include_entities,
+        )
+    if human_readable:
+        indent_xml(root)
+    return ET.ElementTree(root)
+
+
+def convert_json_to_xml_file(source_path, output_path, selected_authors=None,
+                             start_date='', end_date='', use_date_range=False,
+                             include_reactions=True, human_readable=True,
+                             include_service=False, include_media_meta=False,
+                             include_entities=False, anonymize=False,
+                             validate_input=False):
+    source_paths = source_path if isinstance(source_path, list) else [source_path]
+    merged_messages = []
+    validation_issues = []
+
+    for path in source_paths:
+        data = load_json_file(path)
+        if validate_input:
+            validation_issues.extend([f"{path}: {issue}" for issue in validate_telegram_export(data)])
+        merged_messages.extend(data.get('messages', []))
+
+    if anonymize:
+        merged_messages = anonymize_messages(merged_messages)
+
+    messages, filter_stats = filter_messages(
+        merged_messages,
+        selected_authors=selected_authors or set(),
+        start_date=start_date,
+        end_date=end_date,
+        use_date_range=use_date_range,
+        require_text=True,
+        return_stats=True,
+        include_service=include_service,
+    )
+    tree = build_xml_tree(
+        messages,
+        include_reactions=include_reactions,
+        human_readable=human_readable,
+        include_media_meta=include_media_meta,
+        include_entities=include_entities,
+    )
+    tree.write(output_path, encoding='utf-8', xml_declaration=True)
+    return {
+        'messages': len(messages),
+        'output_path': output_path,
+        'filter_stats': filter_stats,
+        'validation_issues': validation_issues,
+    }
 
 class ConversionGUI:
     def __init__(self):
@@ -416,16 +648,6 @@ class ConversionGUI:
         # Bind window resize event
         self.window.bind('<Configure>', self.on_window_resize)
     
-    def browse_source(self):
-        filename = filedialog.askopenfilename(filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
-        if filename:
-            self.source_path.set(filename)
-    
-    def browse_output(self):
-        directory = filedialog.askdirectory()
-        if directory:
-            self.output_dir.set(directory)
-    
     def start_conversion(self):
         if not self.source_path.get() or not self.output_dir.get():
             self.status_var.set("Please select source file and output directory")
@@ -439,6 +661,50 @@ class ConversionGUI:
     
     def run(self):
         self.window.mainloop()
+
+    def _load_source_data(self):
+        source = self.source_path.get()
+        if not source:
+            raise ValueError("Source file is not selected")
+        with open(source, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def _current_date_bounds(self):
+        if not self.use_date_range.get():
+            return '', ''
+        return (
+            self.get_date_string(self.start_year, self.start_month, self.start_day),
+            self.get_date_string(self.end_year, self.end_month, self.end_day),
+        )
+
+    def _get_filtered_messages(self, data=None, use_selected_date_range=True):
+        data = data if data is not None else self._load_source_data()
+        start_date, end_date = ('', '')
+        if use_selected_date_range:
+            start_date, end_date = self._current_date_bounds()
+
+        return filter_messages(
+            data.get('messages', []),
+            selected_authors=self.selected_authors,
+            start_date=start_date,
+            end_date=end_date,
+            use_date_range=use_selected_date_range and self.use_date_range.get(),
+            require_text=True,
+        )
+
+    def _build_xml_tree(self, messages, include_reactions, human_readable):
+        root = ET.Element("messages")
+        for message in messages:
+            build_message_element(root, message, include_reactions=include_reactions)
+        if human_readable:
+            self.indent(root)
+        return ET.ElementTree(root)
+
+    def _xml_size_for_settings(self, messages, human_readable, include_reactions):
+        tree = self._build_xml_tree(messages, include_reactions, human_readable)
+        with io.BytesIO() as bio:
+            tree.write(bio, encoding='utf-8', xml_declaration=True)
+            return len(bio.getvalue())
 
     def get_message_dates_range(self, messages):
         """Get date range for filtered messages"""
@@ -457,117 +723,44 @@ class ConversionGUI:
             return f"({start_date})"
         return f"({start_date}_to_{end_date})"
 
-    def get_reactions_summary(self, messages):
-        """Count all unique reactions in the messages"""
-        reaction_counts = {}
-        for msg in messages:
-            if isinstance(msg, dict) and 'reactions' in msg:
-                for reaction in msg.get('reactions', []):
-                    if isinstance(reaction, dict):
-                        emoji = reaction.get('emoji', '')
-                        count = reaction.get('count', 0)
-                        if emoji and count > 0:
-                            reaction_counts[emoji] = reaction_counts.get(emoji, 0) + count
-        
-        # Format the summary
-        if not reaction_counts:
-            return "No reactions found"
-        
-        summary = "Detected reactions: "
-        reaction_items = [f"{emoji}({count})" for emoji, count in reaction_counts.items()]
-        return summary + ", ".join(reaction_items)
-
-    def get_file_stats(self, messages):
-        """Get statistics about the file"""
-        # Count messages
-        total_messages = len(messages)
-        
-        # Get date range
-        dates = []
-        reaction_counts = {}
-        
-        for msg in messages:
-            if isinstance(msg, dict):
-                # Collect dates
-                if 'date' in msg:
-                    date = msg['date'].split()[0] if ' ' in msg['date'] else msg['date']
-                    dates.append(date)
-                
-                # Count reactions
-                if 'reactions' in msg:
-                    for reaction in msg.get('reactions', []):
-                        if isinstance(reaction, dict):
-                            emoji = reaction.get('emoji', '')
-                            count = reaction.get('count', 0)
-                            if emoji and count > 0:
-                                reaction_counts[emoji] = reaction_counts.get(emoji, 0) + count
-        
-        # Format date range
-        date_range = ""
-        if dates:
-            dates.sort()
-            if dates[0] == dates[-1]:
-                date_range = dates[0]
-            else:
-                date_range = f"{dates[0]} to {dates[-1]}"
-        
-        # Format reactions
-        reaction_str = ", ".join(f"{emoji}({count})" for emoji, count in reaction_counts.items())
-        
-        return f"Messages: {total_messages}\nDate range: {date_range}\nReactions: {reaction_str}"
-
     def update_output_filename(self, *args):
         """Update the output filename when source file is selected"""
         source = self.source_path.get()
         if source:
             source_dir = os.path.dirname(source)
-            self.output_dir.set(source_dir)
             
             try:
-                with open(source, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    messages = data.get('messages', [])
-                    
-                    # Detect if it's a private chat
-                    self.is_private_chat = not data.get('name', '').startswith('@')
-                    
-                    # Collect unique authors
-                    self.authors = {msg.get('from', '') for msg in messages if msg.get('from')}
-                    self.authors.discard('')  # Remove empty author names
-                    
-                    # Update authors listbox
-                    self.authors_listbox.delete(0, tk.END)
-                    for author in sorted(self.authors):
-                        self.authors_listbox.insert(tk.END, author)
-                    
-                    # Show/hide authors frame based on chat type
-                    if self.is_private_chat and self.authors:
-                        self.authors_frame.pack(fill="x", pady=2)
-                        self.authors_listbox.selection_set(0, tk.END)  # Select all by default
-                        self.selected_authors = set(self.authors)  # Initialize with all authors
-                    else:
-                        self.authors_frame.pack_forget()
-                        self.selected_authors = set(self.authors)  # All authors for non-private chats
-                    
-                    # Get chat name and date range for filename
-                    chat_name = data.get('name', 'chat').replace('/', '_')
-                    date_range = self.get_message_dates_range(messages)
-                    
-                    # Set output filename
-                    if date_range:
-                        self.output_filename.set(f"{chat_name}_{date_range}.xml")
-                    else:
-                        self.output_filename.set(f"{chat_name}.xml")
-                    
-                    # Update status to ready state
-                    self.status_var.set("Ready to convert")
-                    
-                    # Update counters after a small delay
-                    self.window.after(1, self.update_all_counters)
-                    
-                    # Update available dates after loading file
-                    self.update_available_dates()
-                    
+                data = self._load_source_data()
+                messages = data.get('messages', [])
+
+                self.is_private_chat = data.get('type') == 'personal_chat'
+
+                self.authors = {
+                    msg.get('from', '')
+                    for msg in messages
+                    if isinstance(msg, dict) and msg.get('type') == 'message' and msg.get('from')
+                }
+                self.authors.discard('')
+
+                self.authors_listbox.delete(0, tk.END)
+                for author in sorted(self.authors):
+                    self.authors_listbox.insert(tk.END, author)
+
+                if self.is_private_chat and self.authors:
+                    self.authors_frame.pack(fill="x", pady=2)
+                else:
+                    self.authors_frame.pack_forget()
+
+                self.authors_listbox.selection_set(0, tk.END)
+                self.selected_authors = set(self.authors)
+
+                export_label = build_export_label(data.get('name', 'chat'), messages)
+                self.output_dir.set(os.path.join(source_dir, export_label))
+                self.output_filename.set(f"{export_label}.xml")
+
+                self.status_var.set("Ready to convert")
+                self.window.after(1, self.update_all_counters)
+                self.update_available_dates()
             except Exception as e:
                 print(f"Error processing file: {str(e)}")
                 self.status_var.set(f"Error: {str(e)}")
@@ -577,103 +770,40 @@ class ConversionGUI:
                 self.output_filename.set("output.xml")
 
     def process_message(self, message, root):
-        """Process message with strict author filtering and text-only content check"""
-        # Skip message processing if no authors are selected
-        if not self.selected_authors:
-            return None
-        
-        author = message.get('from', '')
-        if author in self.selected_authors:
-            # Handle text content which can be string or list
-            text = message.get('text', '')
-            if isinstance(text, list):
-                # If text is a list, join all text elements
-                text = ''.join(item.get('text', '') if isinstance(item, dict) else str(item) for item in text)
-            text = text.strip()
-            
-            # Skip messages without text content
-            if not text:
-                return None
-            
-            msg_element = ET.SubElement(root, "message")
-            
-            # Add message attributes
-            msg_element.set('id', str(message.get('id', '')))
-            msg_element.set('date', message.get('date', ''))
-            msg_element.set('sender', author)
-            
-            # Process message text
-            text_element = ET.SubElement(msg_element, "text")
-            text_element.text = text
-            
-            # Process reply if exists
-            reply_to = message.get('reply_to_message_id')
-            if reply_to:
-                msg_element.set('reply_to', str(reply_to))
-            
-            # Process reactions if enabled
-            if self.include_reactions.get() and 'reactions' in message:
-                reactions_element = ET.SubElement(msg_element, "reactions")
-                for reaction in message['reactions']:
-                    reaction_element = ET.SubElement(reactions_element, "reaction")
-                    reaction_element.set('emoji', reaction.get('emoji', ''))
-                    reaction_element.set('count', str(reaction.get('count', 0)))
-            
-            return msg_element
-        return None
+        """Append one already-filtered message to XML root."""
+        return build_message_element(root, message, include_reactions=self.include_reactions.get())
 
     def convert_json_to_xml(self):
         try:
             if not self.source_path.get() or not self.output_filename.get():
-                self.status_var.set("Error: Please select source and output files")
+                self.status_var.set("Error: Please select source file and output filename")
                 return
-            
-            with open(self.source_path.get(), 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                messages = data.get('messages', [])
-                
-                # Filter messages by selected authors and text content
-                filtered_messages = []
-                for msg in messages:
-                    if msg.get('from', '') in self.selected_authors:
-                        text = msg.get('text', '')
-                        if isinstance(text, list):
-                            text = ''.join(item.get('text', '') if isinstance(item, dict) else str(item) for item in text)
-                        if text.strip():
-                            filtered_messages.append(msg)
-                
-                # Apply date range filter
-                messages = self.filter_messages_by_date(filtered_messages)
-                
-                if not messages:
-                    self.status_var.set("Error: No messages to export")
-                    self.progress_var.set(0)
-                    return
-                
-                root = ET.Element("messages")
-                total_messages = len(messages)
-                processed = 0
-                
-                for message in messages:
-                    self.process_message(message, root)
-                    processed += 1
-                    progress = (processed / total_messages) * 100
-                    self.progress_var.set(progress)
-                    self.window.update_idletasks()
-                
-                # Create XML tree and save
-                tree = ET.ElementTree(root)
-                
-                # Format XML if human readable option is selected
-                if self.human_readable.get():
-                    self.indent(root)
-                
-                output_path = os.path.join(self.output_dir.get(), self.output_filename.get())
-                tree.write(output_path, encoding='utf-8', xml_declaration=True)
-                
-                self.status_var.set(f"Converted successfully: {processed:,} messages")
-                self.progress_var.set(100)
-                
+
+            data = self._load_source_data()
+            messages = self._get_filtered_messages(data=data, use_selected_date_range=True)
+
+            if not messages:
+                self.status_var.set("Error: No messages to export")
+                self.progress_var.set(0)
+                return
+
+            total_messages = len(messages)
+            root = ET.Element("messages")
+            for index, message in enumerate(messages, start=1):
+                self.process_message(message, root)
+                self.progress_var.set((index / total_messages) * 100)
+                self.window.update_idletasks()
+
+            tree = ET.ElementTree(root)
+            if self.human_readable.get():
+                self.indent(root)
+
+            output_path = os.path.join(self.output_dir.get(), self.output_filename.get())
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            tree.write(output_path, encoding='utf-8', xml_declaration=True)
+
+            self.status_var.set(f"Converted successfully: {total_messages:,} messages")
+            self.progress_var.set(100)
         except Exception as e:
             print(f"Error converting file: {str(e)}")
             self.status_var.set(f"Error: {str(e)}")
@@ -827,51 +957,7 @@ Click 'Close' to return to the converter."""
 
     def indent(self, elem, level=0):
         """Add proper indentation to XML elements"""
-        i = "\n" + level*"  "
-        if len(elem):
-            if not elem.text or not elem.text.strip():
-                elem.text = i + "  "
-            if not elem.tail or not elem.tail.strip():
-                elem.tail = i
-            for subelem in elem:
-                self.indent(subelem, level+1)
-            if not elem.tail or not elem.tail.strip():
-                elem.tail = i
-        else:
-            if level and (not elem.tail or not elem.tail.strip()):
-                elem.tail = i
-
-    def select_file(self):
-        """Open file dialog to select JSON file"""
-        filetypes = [
-            ('JSON files', '*.json'),
-            ('All files', '*.*')
-        ]
-        
-        filename = filedialog.askopenfilename(
-            title="Select JSON file",
-            filetypes=filetypes
-        )
-        
-        if filename:
-            self.source_path.set(filename)
-
-    def select_output_dir(self):
-        """Open directory dialog to select output location"""
-        directory = filedialog.askdirectory(
-            title="Select Output Directory"
-        )
-        
-        if directory:
-            self.output_dir.set(directory)
-
-    def handle_reactions_toggle(self):
-        """Handle reactions checkbox toggle"""
-        # Force update of the BooleanVar
-        current_state = self.include_reactions.get()
-        self.include_reactions.set(current_state)
-        # Update format info with new state
-        self.update_format_info()
+        indent_xml(elem, level)
 
     def copy_status_to_clipboard(self, event=None):
         """Copy status text to clipboard and show feedback using pbcopy"""
@@ -927,33 +1013,27 @@ Click 'Close' to return to the converter."""
         try:
             if not self.source_path.get() or not self.selected_authors:
                 return
-            
-            with open(self.source_path.get(), 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                messages = data.get('messages', [])
-                
-                # Filter messages by selected authors
-                dates = []
-                for msg in messages:
-                    if msg.get('from', '') in self.selected_authors:
-                        date_str = msg.get('date', '').split('T')[0]
-                        if date_str:
-                            dates.append(date_str)
-                
-                if dates:
-                    # Sort dates and get min/max
-                    dates.sort()
-                    min_date = dates[0]
-                    max_date = dates[-1]
-                    
-                    # Update date range
-                    self.start_year.set(min_date[:4])
-                    self.start_month.set(min_date[5:7])
-                    self.start_day.set(min_date[8:10])
-                    
-                    self.end_year.set(max_date[:4])
-                    self.end_month.set(max_date[5:7])
-                    self.end_day.set(max_date[8:10])
+
+            data = self._load_source_data()
+            messages = filter_messages(
+                data.get('messages', []),
+                selected_authors=self.selected_authors,
+                use_date_range=False,
+                require_text=True,
+            )
+            dates = sorted([extract_message_date(msg) for msg in messages if extract_message_date(msg)])
+
+            if dates:
+                min_date = dates[0]
+                max_date = dates[-1]
+
+                self.start_year.set(min_date[:4])
+                self.start_month.set(min_date[5:7])
+                self.start_day.set(min_date[8:10])
+
+                self.end_year.set(max_date[:4])
+                self.end_month.set(max_date[5:7])
+                self.end_day.set(max_date[8:10])
             
         except Exception as e:
             print(f"Error updating date range for authors: {str(e)}")
@@ -977,100 +1057,65 @@ Click 'Close' to return to the converter."""
                 self.status_var.set("No authors selected")
                 return
             
-            # Handle non-zero state
-            with open(self.source_path.get(), 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                messages = data.get('messages', [])
-                
-                # Filter messages by selected authors and text content
-                filtered_messages = []
-                for msg in messages:
-                    if msg.get('from', '') in self.selected_authors:
-                        text = msg.get('text', '')
-                        if isinstance(text, list):
-                            text = ''.join(item.get('text', '') if isinstance(item, dict) else str(item) for item in text)
-                        if text.strip():
-                            filtered_messages.append(msg)
-                
-                # Apply date range filter
-                messages = self.filter_messages_by_date(filtered_messages)
-                
-                if not messages:
-                    self.reactions_var.set("No messages found")
-                    self.stats_var.set("Messages: 0\nDate range: (no messages)")
-                    self.format_info.set("(0 characters)")
-                    self.reactions_info.set("(0 characters)")
-                    self.summary_info.set(
-                        "Total characters: 0\n"
-                        "Estimated tokens: 0"
+            data = self._load_source_data()
+            messages = self._get_filtered_messages(data=data, use_selected_date_range=True)
+
+            if not messages:
+                self.reactions_var.set("No messages found")
+                self.stats_var.set("Messages: 0\nDate range: (no messages)")
+                self.format_info.set("(0 characters)")
+                self.reactions_info.set("(0 characters)")
+                self.summary_info.set(
+                    "Total characters: 0\n"
+                    "Estimated tokens: 0"
+                )
+                self.status_var.set("No messages to export")
+                return
+
+            reactions_count = {}
+            for message in messages:
+                for reaction in message.get('reactions', []):
+                    emoji = reaction.get('emoji', '')
+                    count = reaction.get('count', 0)
+                    if emoji and count > 0:
+                        reactions_count[emoji] = reactions_count.get(emoji, 0) + count
+
+            if reactions_count:
+                reactions_list = sorted(reactions_count.items(), key=lambda x: (-x[1], x[0]))
+                window_width = self.window.winfo_width()
+                available_width = window_width - 40
+                avg_item_width = 12
+                min_spacing = 3
+                items_per_row = max(4, available_width // ((avg_item_width + min_spacing) * 8))
+                total_items = len(reactions_list)
+                num_rows = min(6, (total_items + items_per_row - 1) // items_per_row)
+                items_per_row = (total_items + num_rows - 1) // num_rows
+
+                reactions_rows = []
+                for row_start in range(0, total_items, items_per_row):
+                    row_items = reactions_list[row_start:row_start + items_per_row]
+                    spacing = " " * max(
+                        3,
+                        (available_width // 8 - len(row_items) * avg_item_width) //
+                        (len(row_items) - 1 if len(row_items) > 1 else 1),
                     )
-                    self.status_var.set("No messages to export")
-                    return
-                
-                # Update reactions counter
-                reactions_count = {}
-                for message in messages:
-                    if 'reactions' in message:
-                        for reaction in message['reactions']:
-                            emoji = reaction.get('emoji', '')
-                            count = reaction.get('count', 0)
-                            if emoji and count > 0:
-                                reactions_count[emoji] = reactions_count.get(emoji, 0) + count
-                
-                if reactions_count:
-                    # Sort reactions by count (descending) and then by emoji
-                    reactions_list = sorted(reactions_count.items(), key=lambda x: (-x[1], x[0]))
-                    
-                    # Get window width and calculate optimal layout
-                    window_width = self.window.winfo_width()
-                    available_width = window_width - 40  # Account for padding
-                    
-                    # Calculate optimal items per row based on available width
-                    avg_item_width = 12  # Average width of "emoji: number" in characters
-                    min_spacing = 3  # Minimum spaces between items
-                    
-                    # Calculate how many items can fit in one row
-                    items_per_row = max(4, available_width // ((avg_item_width + min_spacing) * 8))
-                    
-                    # Calculate number of rows needed
-                    total_items = len(reactions_list)
-                    num_rows = min(6, (total_items + items_per_row - 1) // items_per_row)
-                    
-                    # Recalculate items per row to distribute items evenly
-                    items_per_row = (total_items + num_rows - 1) // num_rows
-                    
-                    # Create rows with dynamic spacing
-                    reactions_rows = []
-                    for row_start in range(0, total_items, items_per_row):
-                        row_items = reactions_list[row_start:row_start + items_per_row]
-                        # Calculate spacing for this row to fill available width
-                        spacing = " " * max(3, (available_width // 8 - len(row_items) * avg_item_width) // (len(row_items) - 1 if len(row_items) > 1 else 1))
-                        row = spacing.join(f"{emoji}: {count}" for emoji, count in row_items)
-                        reactions_rows.append(row)
-                    
-                    reactions_text = "Reactions:\n" + "\n".join(reactions_rows)
-                else:
-                    reactions_text = "No reactions found"
-                
-                self.reactions_var.set(reactions_text)
-                
-                # Update other counters
-                date_range = self.get_message_dates_range(messages)
-                stats = f"Messages: {len(messages)}\nDate range: {date_range}"
-                self.stats_var.set(stats)
-                
-                # Update format info and status
-                self.update_format_info()
-                self.status_var.set("Ready to convert")
-                
-                # Force window to update and resize if needed
-                self.window.update_idletasks()
-                
-                # Get required height and resize window if needed
-                required_height = self.main_container.winfo_reqheight() + 40
-                current_height = self.window.winfo_height()
-                if required_height > current_height:
-                    self.window.geometry(f"{window_width}x{required_height}")
+                    row = spacing.join(f"{emoji}: {count}" for emoji, count in row_items)
+                    reactions_rows.append(row)
+                reactions_text = "Reactions:\n" + "\n".join(reactions_rows)
+            else:
+                reactions_text = "No reactions found"
+
+            self.reactions_var.set(reactions_text)
+            date_range = self.get_message_dates_range(messages)
+            self.stats_var.set(f"Messages: {len(messages)}\nDate range: {date_range}")
+            self.update_format_info()
+            self.status_var.set("Ready to convert")
+
+            self.window.update_idletasks()
+            required_height = self.main_container.winfo_reqheight() + 40
+            current_height = self.window.winfo_height()
+            if required_height > current_height:
+                self.window.geometry(f"{self.window.winfo_width()}x{required_height}")
                 
         except Exception as e:
             print(f"Error updating counters: {str(e)}")
@@ -1089,28 +1134,16 @@ Click 'Close' to return to the converter."""
 
     def filter_messages_by_date(self, messages):
         """Filter messages by date range if enabled"""
-        if not self.use_date_range.get():
-            return messages
-        
         try:
-            start = self.get_date_string(self.start_year, self.start_month, self.start_day)
-            end = self.get_date_string(self.end_year, self.end_month, self.end_day)
-            
-            if not start and not end:
-                return messages
-            
-            filtered = []
-            for msg in messages:
-                date_str = msg.get('date', '').split('T')[0]  # Get date part only
-                
-                if start and date_str < start:
-                    continue
-                if end and date_str > end:
-                    continue
-                
-                filtered.append(msg)
-            
-            return filtered
+            start, end = self._current_date_bounds()
+            return filter_messages(
+                messages,
+                selected_authors=set(),
+                start_date=start,
+                end_date=end,
+                use_date_range=self.use_date_range.get(),
+                require_text=False,
+            )
         except Exception as e:
             print(f"Date filtering error: {str(e)}")
             return messages
@@ -1137,41 +1170,32 @@ Click 'Close' to return to the converter."""
         """Update available dates based on the loaded file"""
         try:
             if self.source_path.get():
-                with open(self.source_path.get(), 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    messages = data.get('messages', [])
-                    
-                    # Extract all dates from messages
-                    dates = []
-                    for msg in messages:
-                        date_str = msg.get('date', '').split('T')[0]  # YYYY-MM-DD
-                        if date_str:
-                            dates.append(date_str)
-                    
-                    if dates:
-                        # Sort dates and get min/max
-                        dates.sort()
-                        min_date = dates[0]
-                        max_date = dates[-1]
-                        
-                        # Extract unique years
-                        self.years = sorted(list(set(d[:4] for d in dates)))
-                        
-                        # Update dropdowns with available years
-                        for dropdown in [self.start_year_cb, self.end_year_cb]:
-                            dropdown['values'] = [''] + self.years
-                        
-                        # Set default date range to full range
-                        self.start_year.set(min_date[:4])
-                        self.start_month.set(min_date[5:7])
-                        self.start_day.set(min_date[8:10])
-                        
-                        self.end_year.set(max_date[:4])
-                        self.end_month.set(max_date[5:7])
-                        self.end_day.set(max_date[8:10])
-                        
-                        # Enable date range by default
-                        self.use_date_range.set(True)
+                data = self._load_source_data()
+                messages = filter_messages(
+                    data.get('messages', []),
+                    selected_authors=set(),
+                    use_date_range=False,
+                    require_text=False,
+                )
+                dates = sorted([extract_message_date(msg) for msg in messages if extract_message_date(msg)])
+
+                if dates:
+                    min_date = dates[0]
+                    max_date = dates[-1]
+                    self.years = sorted(list(set(d[:4] for d in dates)))
+
+                    for dropdown in [self.start_year_cb, self.end_year_cb]:
+                        dropdown['values'] = [''] + self.years
+
+                    self.start_year.set(min_date[:4])
+                    self.start_month.set(min_date[5:7])
+                    self.start_day.set(min_date[8:10])
+
+                    self.end_year.set(max_date[:4])
+                    self.end_month.set(max_date[5:7])
+                    self.end_day.set(max_date[8:10])
+
+                    self.use_date_range.set(True)
                 
         except Exception as e:
             print(f"Error updating dates: {str(e)}")
@@ -1242,43 +1266,30 @@ Click 'Close' to return to the converter."""
         try:
             if not self.source_path.get() or not self.selected_authors:
                 return
-            
-            with open(self.source_path.get(), 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                messages = data.get('messages', [])
-                
-                # Extract dates only from selected authors' messages
-                dates = []
-                for msg in messages:
-                    if msg.get('from', '') in self.selected_authors:
-                        text = msg.get('text', '')
-                        if isinstance(text, list):
-                            text = ''.join(item.get('text', '') if isinstance(item, dict) else str(item) for item in text)
-                        if text.strip():  # Only consider messages with text content
-                            date_str = msg.get('date', '').split('T')[0]  # YYYY-MM-DD
-                            if date_str:
-                                dates.append(date_str)
-                
-                if dates:
-                    # Sort dates and get min/max
-                    dates.sort()
-                    min_date = dates[0]
-                    max_date = dates[-1]
-                    
-                    # Set date range to available range
-                    self.start_year.set(min_date[:4])
-                    self.start_month.set(min_date[5:7])
-                    self.start_day.set(min_date[8:10])
-                    
-                    self.end_year.set(max_date[:4])
-                    self.end_month.set(max_date[5:7])
-                    self.end_day.set(max_date[8:10])
-                    
-                    # Enable date range if it was disabled
-                    self.use_date_range.set(True)
-                    
-                    # Update counters
-                    self.update_all_counters()
+
+            data = self._load_source_data()
+            messages = filter_messages(
+                data.get('messages', []),
+                selected_authors=self.selected_authors,
+                use_date_range=False,
+                require_text=True,
+            )
+            dates = sorted([extract_message_date(msg) for msg in messages if extract_message_date(msg)])
+
+            if dates:
+                min_date = dates[0]
+                max_date = dates[-1]
+
+                self.start_year.set(min_date[:4])
+                self.start_month.set(min_date[5:7])
+                self.start_day.set(min_date[8:10])
+
+                self.end_year.set(max_date[:4])
+                self.end_month.set(max_date[5:7])
+                self.end_day.set(max_date[8:10])
+
+                self.use_date_range.set(True)
+                self.update_all_counters()
     
         except Exception as e:
             print(f"Error resetting date range: {str(e)}")
@@ -1288,72 +1299,17 @@ Click 'Close' to return to the converter."""
         try:
             if not self.source_path.get():
                 return 0
-            
-            with open(self.source_path.get(), 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                messages = data.get('messages', [])
-                
-                # Filter messages by selected authors and text content
-                filtered_messages = []
-                for msg in messages:
-                    if msg.get('from', '') in self.selected_authors:
-                        text = msg.get('text', '')
-                        if isinstance(text, list):
-                            text = ''.join(item.get('text', '') if isinstance(item, dict) else str(item) for item in text)
-                        if text.strip():
-                            filtered_messages.append(msg)
-                
-                # Apply date range filter
-                messages = self.filter_messages_by_date(filtered_messages)
-                
-                if not messages:
-                    return 0
-                
-                # Calculate format size
-                total_chars = 0
-                
-                for message in messages:
-                    # Base XML structure
-                    total_chars += len(f'<message id="{message.get("id", "")}" '
-                                     f'date="{message.get("date", "")}" '
-                                     f'sender="{message.get("from", "")}"')
-                    
-                    # Text content
-                    text = message.get('text', '')
-                    if isinstance(text, list):
-                        text = ''.join(item.get('text', '') if isinstance(item, dict) else str(item) for item in text)
-                    if text.strip():
-                        total_chars += len('<text>') + len(text) + len('</text>')
-                    
-                    # Reply reference
-                    if message.get('reply_to_message_id'):
-                        total_chars += len(f' reply_to="{message["reply_to_message_id"]}"')
-                    
-                    total_chars += len('/>') if not text else len('</message>')
-                    
-                    # Reactions if enabled
-                    if with_reactions and 'reactions' in message:
-                        total_chars += len('<reactions>')
-                        for reaction in message['reactions']:
-                            total_chars += len('<reaction ') + \
-                                         len(f'emoji="{reaction.get("emoji", "")}" ') + \
-                                         len(f'count="{reaction.get("count", 0)}"') + \
-                                         len('/>')
-                        total_chars += len('</reactions>')
-                
-                # Add root element and XML declaration
-                total_chars += len('<?xml version="1.0" encoding="utf-8"?><messages></messages>')
-                
-                # Add newlines and indentation if human readable
-                if human_readable:
-                    total_chars += len(messages) * 2  # Newlines for each message
-                    if text:
-                        total_chars += len(messages) * 2  # Indentation for text elements
-                    if with_reactions:
-                        reactions_count = sum(1 for m in messages if 'reactions' in m)
-                        total_chars += reactions_count * 4  # Indentation for reactions
-                
-                return total_chars
+
+            data = self._load_source_data()
+            messages = self._get_filtered_messages(data=data, use_selected_date_range=True)
+            if not messages:
+                return 0
+
+            return self._xml_size_for_settings(
+                messages,
+                human_readable=human_readable,
+                include_reactions=with_reactions,
+            )
                 
         except Exception as e:
             print(f"Error calculating total chars: {str(e)}")
@@ -1364,44 +1320,542 @@ Click 'Close' to return to the converter."""
         try:
             if not self.source_path.get():
                 return 0
-            
-            with open(self.source_path.get(), 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                messages = data.get('messages', [])
-                
-                # Filter messages
-                filtered_messages = []
-                for msg in messages:
-                    if msg.get('from', '') in self.selected_authors:
-                        text = msg.get('text', '')
-                        if isinstance(text, list):
-                            text = ''.join(item.get('text', '') if isinstance(item, dict) else str(item) for item in text)
-                        if text.strip():
-                            filtered_messages.append(msg)
-                
-                # Apply date range filter
-                messages = self.filter_messages_by_date(filtered_messages)
-                
-                # Calculate reactions size
-                reactions_chars = 0
-                for message in messages:
-                    if 'reactions' in message:
-                        reactions_chars += len('<reactions>')
-                        for reaction in message['reactions']:
-                            reactions_chars += len('<reaction ') + \
-                                            len(f'emoji="{reaction.get("emoji", "")}" ') + \
-                                            len(f'count="{reaction.get("count", 0)}"') + \
-                                            len('/>')
-                        reactions_chars += len('</reactions>')
-                
-                return reactions_chars
+
+            data = self._load_source_data()
+            messages = self._get_filtered_messages(data=data, use_selected_date_range=True)
+            if not messages:
+                return 0
+
+            with_reactions = self._xml_size_for_settings(
+                messages,
+                human_readable=self.human_readable.get(),
+                include_reactions=True,
+            )
+            without_reactions = self._xml_size_for_settings(
+                messages,
+                human_readable=self.human_readable.get(),
+                include_reactions=False,
+            )
+            return max(0, with_reactions - without_reactions)
                 
         except Exception as e:
             print(f"Error calculating reaction chars: {str(e)}")
             return 0
 
-# Modify main function
+def _prompt_yes_no(prompt, default=True):
+    suffix = "[Y/n]" if default else "[y/N]"
+    value = input(f"{prompt} {suffix}: ").strip().lower()
+    if not value:
+        return default
+    return value in {"y", "yes", "1", "true"}
+
+
+def _arrow_ui_available():
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return False
+    try:
+        import curses  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _menu_single_select(title, options, default_index=0):
+    if not options:
+        raise ValueError("Options list is empty")
+
+    if not _arrow_ui_available():
+        print(title)
+        for idx, option in enumerate(options, start=1):
+            print(f"  {idx}. {option}")
+        raw = input(f"Select [1-{len(options)}] (default {default_index + 1}): ").strip()
+        if raw.isdigit():
+            chosen = int(raw) - 1
+            if 0 <= chosen < len(options):
+                return chosen
+        return default_index
+
+    import curses
+
+    def _draw(stdscr):
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        index = max(0, min(default_index, len(options) - 1))
+
+        while True:
+            stdscr.clear()
+            stdscr.addstr(0, 0, title)
+            stdscr.addstr(1, 0, "Use arrows, Enter to select")
+            for i, option in enumerate(options):
+                prefix = "➤ " if i == index else "  "
+                stdscr.addstr(i + 3, 0, f"{prefix}{option}")
+            stdscr.refresh()
+            key = stdscr.getch()
+
+            if key in (curses.KEY_UP, ord('k')):
+                index = (index - 1) % len(options)
+            elif key in (curses.KEY_DOWN, ord('j')):
+                index = (index + 1) % len(options)
+            elif key in (10, 13, curses.KEY_ENTER):
+                return index
+            elif key in (27, ord('q')):
+                return default_index
+
+    return curses.wrapper(_draw)
+
+
+def _menu_multi_select(title, options, default_selected=None):
+    default_selected = set(default_selected or [])
+    if not options:
+        return set()
+
+    if not _arrow_ui_available():
+        print(title)
+        for idx, option in enumerate(options, start=1):
+            mark = "x" if option in default_selected else " "
+            print(f"  [{mark}] {idx}. {option}")
+        raw = input("Select numbers comma-separated (empty = defaults): ").strip()
+        if not raw:
+            return set(default_selected) if default_selected else set(options)
+        indexes = []
+        for chunk in raw.split(","):
+            chunk = chunk.strip()
+            if chunk.isdigit():
+                indexes.append(int(chunk))
+        return {options[i - 1] for i in indexes if 1 <= i <= len(options)}
+
+    import curses
+
+    def _draw(stdscr):
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        index = 0
+        selected = {i for i, opt in enumerate(options) if opt in default_selected}
+
+        if not selected:
+            selected = set(range(len(options)))
+
+        while True:
+            stdscr.clear()
+            stdscr.addstr(0, 0, title)
+            stdscr.addstr(1, 0, "Arrows navigate, Space toggle, a=all, Enter confirm")
+            for i, option in enumerate(options):
+                cursor = "➤" if i == index else " "
+                mark = "x" if i in selected else " "
+                stdscr.addstr(i + 3, 0, f"{cursor} [{mark}] {option}")
+            stdscr.refresh()
+            key = stdscr.getch()
+
+            if key in (curses.KEY_UP, ord('k')):
+                index = (index - 1) % len(options)
+            elif key in (curses.KEY_DOWN, ord('j')):
+                index = (index + 1) % len(options)
+            elif key == ord(' '):
+                if index in selected:
+                    selected.remove(index)
+                else:
+                    selected.add(index)
+            elif key in (ord('a'), ord('A')):
+                selected = set(range(len(options)))
+            elif key in (10, 13, curses.KEY_ENTER):
+                if not selected:
+                    selected = set(range(len(options)))
+                return {options[i] for i in sorted(selected)}
+            elif key in (27, ord('q')):
+                return {options[i] for i in sorted(selected)}
+
+    return curses.wrapper(_draw)
+
+
+def _menu_yes_no(title, default=True):
+    options = ["Yes", "No"]
+    default_index = 0 if default else 1
+    selected = _menu_single_select(title, options, default_index=default_index)
+    return selected == 0
+
+
+def _preset_store_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tgxml_presets.json")
+
+
+def _load_presets():
+    path = _preset_store_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_presets(presets):
+    path = _preset_store_path()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(presets, f, ensure_ascii=False, indent=2)
+
+
+def _print_banner(use_plain=False):
+    if use_plain:
+        return
+    print("=" * 56)
+    print(" Telegram JSON -> XML Converter (Interactive CLI) ".center(56, "="))
+    print("=" * 56)
+
+
+def _parse_cli_args(argv):
+    examples = (
+        "Quick start:\n"
+        "  python3 jsontoxml.py --cli\n\n"
+        "One-shot run (no menu):\n"
+        "  python3 jsontoxml.py --cli --run --source chat.json --output out.xml\n\n"
+        "Textual TUI:\n"
+        "  python3 jsontoxml.py --tui\n\n"
+        "Interactive wizard:\n"
+        "  python3 jsontoxml.py --interactive --source chat.json\n\n"
+        "Filter by author/date:\n"
+        "  python3 jsontoxml.py --cli --run --source chat.json --author Alice --start-date 2025-01-01 --end-date 2025-02-01\n\n"
+        "Dry run (no file write):\n"
+        "  python3 jsontoxml.py --cli --run --source chat.json --dry-run --report-json"
+    )
+    parser = argparse.ArgumentParser(
+        description="Convert Telegram JSON export to XML (GUI and CLI).",
+        epilog=examples,
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument("--cli", action="store_true", help="Force CLI mode")
+    parser.add_argument("--run", action="store_true", help="Run one-shot conversion (skip menu)")
+    parser.add_argument("--tui", action="store_true", help="Run modern Textual TUI mode")
+    parser.add_argument("--interactive", action="store_true", help="Run interactive CLI wizard")
+    parser.add_argument("--source", help="Path to source Telegram JSON")
+    parser.add_argument("--sources", nargs="+", help="Multiple source JSON files to merge")
+    parser.add_argument("--output", help="Output XML file path")
+    parser.add_argument("--output-dir", help="Output directory (if --output is not set)")
+    parser.add_argument("--author", action="append", default=[], help="Author to include (repeatable)")
+    parser.add_argument("--start-date", default="", help="Start date (YYYY, YYYY-MM, or YYYY-MM-DD)")
+    parser.add_argument("--end-date", default="", help="End date (YYYY, YYYY-MM, or YYYY-MM-DD)")
+    parser.add_argument("--no-date-filter", action="store_true", help="Disable date filtering")
+    parser.add_argument("--no-reactions", action="store_true", help="Exclude reactions from XML")
+    parser.add_argument("--compact", action="store_true", help="Write compact XML (no pretty indentation)")
+    parser.add_argument("--dry-run", action="store_true", help="Evaluate filters and report stats without writing XML")
+    parser.add_argument("--report-json", action="store_true", help="Print dry-run/conversion report as JSON")
+    parser.add_argument("--include-service", action="store_true", help="Include Telegram service messages")
+    parser.add_argument("--include-media-meta", action="store_true", help="Include media metadata in XML")
+    parser.add_argument("--include-entities", action="store_true", help="Include text_entities in XML")
+    parser.add_argument("--anonymize", action="store_true", help="Anonymize authors and identifiers in output")
+    parser.add_argument("--validate-input", action="store_true", help="Validate input JSON structure before conversion")
+    parser.add_argument("--plain", action="store_true", help="Plain interactive output (no TUI decorations)")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors in CLI output")
+    parser.add_argument("--preset", help="Load conversion preset by name")
+    parser.add_argument("--save-preset", help="Save current options as preset name")
+    return parser.parse_args(argv)
+
+
+def run_cli(args):
+    from src.tgxml.cli_flow import (
+        build_conversion_payload,
+        create_report,
+        format_dry_run_report,
+        write_xml,
+        build_replay_command,
+        report_as_json,
+    )
+
+    source_path = args.source
+    source_paths = list(args.sources or [])
+    if source_path and source_path not in source_paths:
+        source_paths.append(source_path)
+
+    output_path = args.output
+    output_dir = args.output_dir
+    selected_authors = set(args.author or [])
+    use_date_range = not args.no_date_filter
+    start_date = args.start_date
+    end_date = args.end_date
+    include_reactions = not args.no_reactions
+    human_readable = not args.compact
+    dry_run = args.dry_run
+    include_service = args.include_service
+    include_media_meta = args.include_media_meta
+    include_entities = args.include_entities
+    anonymize = args.anonymize
+    validate_input = args.validate_input
+    plain = args.plain
+    no_color = args.no_color
+
+    _print_banner(use_plain=plain)
+
+    presets = _load_presets()
+    if args.preset:
+        preset_data = presets.get(args.preset)
+        if not preset_data:
+            raise ValueError(f"Preset not found: {args.preset}")
+        selected_authors = set(preset_data.get("selected_authors", list(selected_authors)))
+        use_date_range = bool(preset_data.get("use_date_range", use_date_range))
+        start_date = preset_data.get("start_date", start_date)
+        end_date = preset_data.get("end_date", end_date)
+        include_reactions = bool(preset_data.get("include_reactions", include_reactions))
+        human_readable = bool(preset_data.get("human_readable", human_readable))
+        include_service = bool(preset_data.get("include_service", include_service))
+        include_media_meta = bool(preset_data.get("include_media_meta", include_media_meta))
+        include_entities = bool(preset_data.get("include_entities", include_entities))
+        anonymize = bool(preset_data.get("anonymize", anonymize))
+        validate_input = bool(preset_data.get("validate_input", validate_input))
+
+    if args.interactive:
+        if not source_paths:
+            single_source = input("Source JSON path: ").strip()
+            source_paths = [single_source]
+
+        data = load_json_file(source_paths[0])
+        messages = data.get('messages', [])
+        available_authors = get_available_authors(messages)
+        min_date, max_date = get_date_range_from_messages(messages)
+
+        mode_index = _menu_single_select(
+            "Interactive CLI",
+            [
+                "Quick convert (defaults)",
+                "Wizard (full options)",
+                "Inspect source",
+                "Presets",
+                "Exit",
+            ],
+            default_index=1,
+        )
+
+        if mode_index == 2:
+            print(f"Source: {source_paths[0]}")
+            print(f"Raw items: {len(messages)}")
+            print(f"Message authors: {len(available_authors)}")
+            if min_date and max_date:
+                print(f"Date range: {min_date} .. {max_date}")
+            print("Authors:")
+            for author in available_authors:
+                print(f"  - {author}")
+            return
+
+        if mode_index == 3:
+            if not presets:
+                print("No presets found.")
+                return
+            preset_names = sorted(list(presets.keys()))
+            idx = _menu_single_select("Choose preset", preset_names, default_index=0)
+            selected = presets[preset_names[idx]]
+            selected_authors = set(selected.get("selected_authors", []))
+            use_date_range = bool(selected.get("use_date_range", True))
+            start_date = selected.get("start_date", "")
+            end_date = selected.get("end_date", "")
+            include_reactions = bool(selected.get("include_reactions", True))
+            human_readable = bool(selected.get("human_readable", True))
+            include_service = bool(selected.get("include_service", False))
+            include_media_meta = bool(selected.get("include_media_meta", False))
+            include_entities = bool(selected.get("include_entities", False))
+            anonymize = bool(selected.get("anonymize", False))
+            validate_input = bool(selected.get("validate_input", False))
+            dry_run = bool(selected.get("dry_run", False))
+            output_dir = selected.get("output_dir", output_dir)
+            output_path = selected.get("output_path", output_path)
+        elif mode_index == 4:
+            print("Aborted by user")
+            return
+
+        if mode_index == 0:
+            selected_authors = set(available_authors)
+            use_date_range = True if (min_date or max_date) else False
+            start_date = min_date
+            end_date = max_date
+            include_reactions = True
+            human_readable = True
+        else:
+            print(f"Detected {len(available_authors)} authors and {len(messages)} raw messages.")
+            if min_date and max_date:
+                print(f"Detected date range: {min_date} .. {max_date}")
+
+            if available_authors:
+                selected_authors = _menu_multi_select(
+                    "Select authors",
+                    available_authors,
+                    default_selected=set(available_authors),
+                )
+            else:
+                selected_authors = set()
+
+            use_date_range = _menu_yes_no("Enable date filter?", default=True)
+            if use_date_range:
+                default_start = min_date if min_date else ""
+                default_end = max_date if max_date else ""
+                while True:
+                    start_input = input(f"Start date [{default_start}] (h/? help, s skip, q quit): ").strip()
+                    if start_input in {"h", "?"}:
+                        print("Use YYYY, YYYY-MM or YYYY-MM-DD. Empty keeps default.")
+                        continue
+                    if start_input == "q":
+                        print("Aborted by user")
+                        return
+                    if start_input == "s":
+                        start_input = ""
+                    break
+                while True:
+                    end_input = input(f"End date [{default_end}] (h/? help, s skip, b back, q quit): ").strip()
+                    if end_input in {"h", "?"}:
+                        print("Use YYYY, YYYY-MM or YYYY-MM-DD. Empty keeps default.")
+                        continue
+                    if end_input == "q":
+                        print("Aborted by user")
+                        return
+                    if end_input == "b":
+                        start_input = input(f"Start date [{default_start}]: ").strip()
+                        continue
+                    if end_input == "s":
+                        end_input = ""
+                    break
+                start_date = start_input or default_start
+                end_date = end_input or default_end
+            else:
+                start_date = ""
+                end_date = ""
+
+            include_reactions = _menu_yes_no("Include reactions?", default=True)
+            human_readable = _menu_yes_no("Human-readable XML?", default=True)
+            include_service = _menu_yes_no("Include service messages?", default=False)
+            include_media_meta = _menu_yes_no("Include media metadata?", default=False)
+            include_entities = _menu_yes_no("Include text entities?", default=False)
+            anonymize = _menu_yes_no("Anonymize authors/ids?", default=False)
+            validate_input = _menu_yes_no("Validate input structure?", default=True)
+            dry_run = _menu_yes_no("Dry run (do not write XML)?", default=False)
+
+        if not output_dir:
+            output_dir = input("Output directory (empty = auto chat folder): ").strip() or None
+
+        if _menu_yes_no("Save these options as preset?", default=False):
+            preset_name = input("Preset name: ").strip()
+            if preset_name:
+                presets[preset_name] = {
+                    "selected_authors": sorted(list(selected_authors)),
+                    "use_date_range": use_date_range,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "include_reactions": include_reactions,
+                    "human_readable": human_readable,
+                    "include_service": include_service,
+                    "include_media_meta": include_media_meta,
+                    "include_entities": include_entities,
+                    "anonymize": anonymize,
+                    "validate_input": validate_input,
+                    "dry_run": dry_run,
+                    "output_dir": output_dir,
+                    "output_path": output_path,
+                }
+                _save_presets(presets)
+                print(f"Preset saved: {preset_name}")
+    else:
+        if not source_paths:
+            raise ValueError("CLI mode requires --source")
+
+    payload = build_conversion_payload(
+        source_paths=source_paths,
+        output_path=output_path,
+        output_dir=output_dir,
+        selected_authors=selected_authors,
+        start_date=start_date,
+        end_date=end_date,
+        use_date_range=use_date_range,
+        include_service=include_service,
+        include_media_meta=include_media_meta,
+        include_entities=include_entities,
+        include_reactions=include_reactions,
+        human_readable=human_readable,
+        anonymize=anonymize,
+        validate_input=validate_input,
+    )
+    output_path = payload["output_path"]
+    report = create_report(payload, dry_run=dry_run)
+
+    if args.save_preset:
+        presets[args.save_preset] = {
+            "selected_authors": sorted(list(selected_authors)),
+            "use_date_range": use_date_range,
+            "start_date": start_date,
+            "end_date": end_date,
+            "include_reactions": include_reactions,
+            "human_readable": human_readable,
+            "include_service": include_service,
+            "include_media_meta": include_media_meta,
+            "include_entities": include_entities,
+            "anonymize": anonymize,
+            "validate_input": validate_input,
+            "dry_run": dry_run,
+            "output_dir": output_dir,
+            "output_path": output_path,
+        }
+        _save_presets(presets)
+
+    if dry_run:
+        if args.report_json:
+            print(report_as_json(report))
+        else:
+            print(format_dry_run_report(report))
+        return
+
+    write_xml(payload)
+    filter_stats = payload["filter_stats"]
+    validation_issues = payload["validation_issues"]
+
+    if args.report_json:
+        print(report_as_json(report))
+    else:
+        print(f"Converted successfully: {filter_stats['included']} messages")
+        print(f"Output: {output_path}")
+        if validation_issues:
+            print("Validation issues:")
+            for issue in validation_issues:
+                print(f"  - {issue}")
+        replay = build_replay_command(payload, no_color=no_color, plain=plain)
+        print("Replay command:")
+        print("  " + replay)
+
+
 def main():
+    args = _parse_cli_args(sys.argv[1:])
+
+    # If user passed direct sources without explicit mode, keep one-shot behavior.
+    if (args.source or args.sources) and not args.cli and not args.tui and not args.interactive:
+        args.run = True
+
+    if args.tui:
+        try:
+            from src.tgxml.tui_app import run_textual_tui
+            run_textual_tui()
+        except Exception as exc:
+            raise SystemExit(
+                f"Textual TUI is not available: {exc}. "
+                "Install it with: python3 -m pip install textual"
+            ) from exc
+        return
+
+    # Default CLI mode should open a menu-first experience, not auto-run conversion.
+    if args.cli and not args.run:
+        try:
+            from src.tgxml.tui_app import run_textual_tui
+            run_textual_tui()
+            return
+        except Exception:
+            args.interactive = True
+
+    run_in_cli = args.cli or args.interactive or args.run
+
+    if run_in_cli:
+        run_cli(args)
+        return
+
+    if tk is None:
+        raise RuntimeError(
+            "Tkinter is not available in this Python environment. "
+            "Use CLI mode (--cli) or one-shot (--cli --run --source ...), or install Tkinter to run GUI."
+        )
+
     gui = ConversionGUI()
     gui.run()
 

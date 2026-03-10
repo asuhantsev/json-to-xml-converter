@@ -1,95 +1,252 @@
 # JSON to XML Telegram Chat Converter
 
-A GUI application to convert Telegram chat JSON exports to XML format with filtering options.
+Convert Telegram chat/channel JSON exports into clean XML with filtering by author/date and optional reactions.
 
-## Prerequisites
+## What this project is for
+This tool helps you transform Telegram export JSON into XML that is easier to:
+- feed into downstream parsers;
+- archive and version;
+- run text analytics on.
 
-- Python 3.7 or higher
-- Tkinter (usually comes with Python)
+The project now supports two modes:
+- GUI mode (Tkinter): convenient local desktop usage;
+- CLI mode: scriptable and automation-friendly (works even when Tkinter is unavailable).
+- TUI mode (Textual): modern terminal UI with form-driven workflow (`--tui`).
 
-## Installation
+Modular package entrypoint is also available:
+- `python3 -m tgxml ...` (requires `PYTHONPATH=src`)
 
-1. First, ensure you have Python installed:
-```bash
-python3 --version
-```
+## Input and output
 
-2. If Python is not installed, install it using Homebrew:
-```bash
-brew install python
-```
+### Expected input
+Telegram export JSON with root fields like:
+- `name`, `type`, `id`
+- `messages[]`
 
-3. Verify Tkinter is installed (it usually comes with Python):
-```python
-python3 -c "import tkinter; tkinter._test()"
-```
+Each message is expected to follow Telegram export semantics (`type`, `date`, `from`, `text`, optional `reactions`).
 
-If you see a test window appear, Tkinter is installed correctly.
+### Output format
+XML root is always:
+- `<messages>`
 
-4. If Tkinter is missing, you can install it with:
-```bash
-brew install python-tk
-```
+Each exported message is:
+- `<message id="..." date="..." sender="..." [reply_to="..."]>`
+- nested `<text>...</text>`
+- optional `<reactions><reaction emoji="..." count="..."/></reactions>`
 
-## Running the Application
+## Features
+- Message filtering:
+  - by selected authors;
+  - by date range (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`).
+- Message selection rules:
+  - includes only `type == "message"`;
+  - skips messages with empty text.
+- Extended export options:
+  - include Telegram `service` messages;
+  - include media metadata (`photo`, `file`, dimensions, MIME, etc.);
+  - include `text_entities`;
+  - anonymize authors and ids;
+  - merge multiple source exports.
+- Output controls:
+  - include/exclude reactions;
+  - human-readable XML (indented) or compact XML.
+- Live counters in GUI.
+- Interactive CLI wizard and simple command mode.
+- Interactive CLI start menu with arrow-key navigation in TTY terminals.
+- Dry-run mode with filter diagnostics report.
 
-There are several ways to run the application:
+## Requirements
+- Python 3.8+
+- For GUI mode: Tkinter installed in Python runtime.
 
-### 1. Double-Click Method (Easiest)
-Simply double-click the `Run Converter.command` file in Finder.
+## Run
 
-### 2. Shell Script
-Double-click or run the `run.sh` script.
-
-### 3. Terminal Method
-1. Open Terminal and navigate to the project directory:
-```bash
-cd path/to/json-to-xml-tgchat
-```
-
-2. Run the script:
+### GUI mode
 ```bash
 python3 jsontoxml.py
 ```
 
-## Usage
+If Tkinter is missing, GUI mode will fail with a clear error. Use CLI mode instead.
 
-1. Click "Select JSON file" to choose your Telegram chat export file
-2. The output location will automatically be set to the source file directory
-3. Adjust export options as needed:
-   - Enable/disable human-readable format
-   - Include/exclude reactions
-   - Filter by date range
-   - Select specific authors (for private chats)
-4. Click "CONVERT" to process the file
-5. The converted XML file will be saved in the selected output directory
+### CLI mode (simple command)
+```bash
+python3 jsontoxml.py --cli --run --source exports/ChatExport_2024-12-27/result.json --output exports/out.xml
+```
+
+Alternative package run:
+```bash
+PYTHONPATH=src python3 -m tgxml --cli --run --source exports/ChatExport_2024-12-27/result.json --output exports/out.xml
+```
+
+### CLI mode (interactive wizard)
+```bash
+python3 jsontoxml.py --interactive --source exports/ChatExport_2024-12-27/result.json
+```
+
+### TUI mode (Textual)
+```bash
+python3 jsontoxml.py --tui
+```
+
+TUI provides:
+- source/form-based options editing;
+- inspect, dry-run and export actions;
+- keyboard-first navigation with modern terminal UI widgets.
+
+In TTY terminals, interactive mode supports arrow navigation:
+- Up/Down to move
+- Enter to select
+- Space to toggle author in multi-select
+- `a` to select all authors
+- `q`/Esc to quit current menu
+
+## macOS app packaging
+
+You can package the GUI version as a native `.app` and a single distributable `.zip`:
+
+```bash
+./scripts/build_macos_app.sh
+```
+
+Build outputs:
+- `dist/Telegram JSON XML Converter.app`
+- `dist/Telegram_JSON_XML_Converter-macOS.zip`
+
+Notes:
+- Build on macOS.
+- Current Python runtime must include Tkinter.
+- For sharing outside your machine, you may additionally sign/notarize the app.
+
+## CLI reference
+
+### Required for non-interactive mode
+- `--source <path>`: source Telegram JSON.
+
+### Output options
+- `--output <path>`: exact output XML path.
+- `--output-dir <dir>`: output directory (used if `--output` omitted).
+
+### Filtering options
+- `--author <name>` (repeatable): include only selected authors.
+- `--sources <path1 path2 ...>`: merge multiple source JSON files.
+- `--start-date <date>`: lower date bound.
+- `--end-date <date>`: upper date bound.
+- `--no-date-filter`: disable date filtering.
+
+### Content/format options
+- `--no-reactions`: exclude reactions.
+- `--compact`: produce compact XML (no pretty indentation).
+- `--dry-run`: calculate result without writing XML file.
+- `--report-json`: print machine-readable run report.
+- `--include-service`: include Telegram service events.
+- `--include-media-meta`: include media metadata in XML.
+- `--include-entities`: include `text_entities` in XML.
+- `--anonymize`: anonymize names and id-like fields.
+- `--validate-input`: validate Telegram JSON structure before conversion.
+- `--preset <name>` / `--save-preset <name>`: load/save option presets.
+
+### Mode switches
+- `--cli`: force CLI mode.
+- `--run`: one-shot conversion (non-interactive).
+- `--interactive`: run prompt-based CLI wizard.
+- `--tui`: run Textual-based terminal UI.
+
+## Examples
+
+### Export all messages (compact XML, no reactions)
+```bash
+python3 jsontoxml.py --cli \
+  --run \
+  --source exports/ChatExport_2024-12-27/result.json \
+  --output exports/chat_compact.xml \
+  --compact \
+  --no-reactions \
+  --no-date-filter
+```
+
+### Export one author for a date window
+```bash
+python3 jsontoxml.py --cli \
+  --run \
+  --source exports/ChatExport_2024-12-27/result.json \
+  --output exports/chat_filtered.xml \
+  --author "Author Name" \
+  --start-date 2024-01-01 \
+  --end-date 2024-12-31
+```
+
+### Dry-run with JSON report
+```bash
+python3 jsontoxml.py --cli \
+  --run \
+  --source exports/ChatExport_2024-12-27/result.json \
+  --dry-run \
+  --report-json
+```
+
+### Merge two exports with anonymization and extended metadata
+```bash
+python3 jsontoxml.py --cli \
+  --run \
+  --sources exports/a/result.json exports/b/result.json \
+  --output exports/merged.xml \
+  --include-service \
+  --include-media-meta \
+  --include-entities \
+  --anonymize \
+  --validate-input
+```
+
+## Smoke test
+Run a quick end-to-end check:
+```bash
+./scripts/smoke_test.sh
+```
+
+What it verifies:
+- CLI conversion runs successfully.
+- Output XML is created.
+- Root tag is `messages`.
+- At least one `<message>` exists.
+
+## Project structure
+- `jsontoxml.py` - current main entrypoint (GUI + CLI)
+- `src/tgxml/core.py` - modular core facade
+- `src/tgxml/cli.py` - modular CLI entrypoint
+- `src/tgxml/gui.py` - modular GUI entrypoint
+- `src/tgxml/models.py` - dataclass models
+- `tests/` - unit and e2e tests
+- `scripts/smoke_test.sh` - smoke verification
+- `scripts/benchmark_large_export.py` - performance baseline
+- `docs/modularization-plan.md` - stage-2 modular split plan
+- `docs/release-policy.md` - release process
+- `legacy/` - archived non-core and historical artifacts
+- `exports/` - output artifacts
 
 ## Troubleshooting
 
-If you encounter any issues:
+### `ModuleNotFoundError: No module named '_tkinter'`
+Your Python runtime has no Tkinter. Use CLI mode, or install Tkinter for GUI usage.
 
-1. Verify Python installation:
+### `Error: No messages to export`
+Likely all messages were filtered out by author/date or empty text filtering.
+
+### Invalid JSON / parse error
+Ensure the source file is valid Telegram export JSON and UTF-8 encoded.
+
+### Arrow navigation does not work
+Arrow-key menus are enabled only in TTY terminals with curses support.
+In non-TTY/CI, CLI automatically falls back to plain text prompts.
+
+### Textual mode does not start
+Install Textual:
 ```bash
-which python3
+python3 -m pip install textual
 ```
 
-2. Check Tkinter installation:
-```bash
-python3 -c "import tkinter; print(tkinter.TkVersion)"
-```
-
-3. If you see permission errors, you might need to run:
-```bash
-chmod +x jsontoxml.py
-chmod +x run.sh
-chmod +x "Run Converter.command"
-```
-
-4. If the double-click methods don't work:
-   - Right-click the file
-   - Select "Open With" → "Terminal"
-   - Click "Open" if prompted about security
-
-For additional help, click the "HELP" button in the application interface.
-
-
+## Product direction
+Target quality bar:
+- lightweight runtime;
+- deterministic filtering and output;
+- clear UX in both GUI and CLI;
+- easy onboarding via complete documentation.
